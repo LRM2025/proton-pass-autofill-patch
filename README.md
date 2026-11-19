@@ -2,6 +2,10 @@
 
 An unofficial source patch for the Proton Pass desktop Chrome extension. It adds search to the login menu next to the form and can fill an empty password field using the email already on the page.
 
+![Proton Pass inline search showing two matching logins from fictional demo data](assets/inline-search-demo.png)
+
+*Screenshot of the patched Chrome extension with fictional demo logins.*
+
 Based on [Proton Pass 1.44.0](https://github.com/ProtonMail/WebClients/tree/proton-pass%401.44.0), pinned to [commit `c890377`](https://github.com/ProtonMail/WebClients/commit/c890377cb5da6c2041941cb67557e3ec367638a5). The patch was authored and marked as a modification on November 19, 2026.
 
 ## What changes
