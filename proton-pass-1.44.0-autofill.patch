@@ -1,0 +1,652 @@
+diff --git a/applications/pass-extension/jest.config.ts b/applications/pass-extension/jest.config.ts
+index d014825a788d58d3c8202295a66e5d8edc9aefdc..893f14b7bb2010013644fc37c896235abef07b07 100644
+--- a/applications/pass-extension/jest.config.ts
++++ b/applications/pass-extension/jest.config.ts
+@@ -46,6 +46,7 @@ const jestConfig: Config = {
+     testTimeout: 30000,
+     resolver: './jest.resolver.js',
+     moduleNameMapper: {
++        '^webextension-polyfill$': '<rootDir>/src/__mocks__/webextension-polyfill/index.ts',
+         '\\.(jpg|jpeg|png|gif|eot|otf|webp|svg|ttf|woff|woff2|mp4|webm)$': '@proton/components/__mocks__/fileMock.js',
+         '\\.(css|scss|less)$': '@proton/components/__mocks__/styleMock.js',
+         '\\.raw.scss$': '@proton/components/__mocks__/styleMock.js',
+diff --git a/applications/pass-extension/manifest-chrome.json b/applications/pass-extension/manifest-chrome.json
+index 0cd6837c195c5f36e8480d71940f6c3cd885fa42..bb72816a75a9e7bf6394d65ef55c6b2fe7d7adc6 100644
+--- a/applications/pass-extension/manifest-chrome.json
++++ b/applications/pass-extension/manifest-chrome.json
+@@ -1,5 +1,5 @@
+ {
+-    "name": "Proton Pass: Free Password Manager",
++    "name": "Proton Pass (Private Build)",
+     "description": "Free and fully encrypted password manager to keep your logins and passwords safe.",
+     "version": "1.44.0",
+     "manifest_version": 3,
+diff --git a/applications/pass-extension/src/app/content/services/autofill/autofill.login-email.ts b/applications/pass-extension/src/app/content/services/autofill/autofill.login-email.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c54cecf99427a8793b6e16ec31a444da71be9e27
+--- /dev/null
++++ b/applications/pass-extension/src/app/content/services/autofill/autofill.login-email.ts
+@@ -0,0 +1,11 @@
++import { FieldType, FormType } from '@protontech/autofill/types';
++
++import type { FieldHandle } from '../form/field';
++
++export const getLoginEmailField = (password: FieldHandle) => {
++    const form = password.getFormHandle();
++    if (password.fieldType !== FieldType.PASSWORD_CURRENT || form.formType !== FormType.LOGIN) return;
++
++    const identifiers = [...form.getFieldsFor(FieldType.EMAIL), ...form.getFieldsFor(FieldType.USERNAME)];
++    if (identifiers.length === 1) return identifiers[0];
++};
+diff --git a/applications/pass-extension/src/app/content/services/autofill/autofill.service.ts b/applications/pass-extension/src/app/content/services/autofill/autofill.service.ts
+index 1ac5c5f430d18062fae3d64ef207545eb48c0319..b5ec3f10ec2036dc80b3f7e4cad8accc68074c34 100644
+--- a/applications/pass-extension/src/app/content/services/autofill/autofill.service.ts
++++ b/applications/pass-extension/src/app/content/services/autofill/autofill.service.ts
+@@ -7,6 +7,8 @@ import { TelemetryEventName } from '@proton/pass/types/data/telemetry';
+ import type { AsyncCallback, MaybeNull } from '@proton/pass/types/utils';
+ import type { FormCredentials } from '@proton/pass/types/worker/form';
+ import { first } from '@proton/pass/utils/array/first';
++import { isActiveElement } from '@proton/pass/utils/dom/active-element';
++import { isInputElement } from '@proton/pass/utils/dom/predicates';
+ import { truthy } from '@proton/pass/utils/fp/predicates';
+ import { asyncLock } from '@proton/pass/utils/fp/promises';
+ import { safeCall } from '@proton/pass/utils/fp/safe-call';
+@@ -28,9 +30,11 @@ import { getAutofillPageTelemetryDimensions } from '../../utils/autofill-telemet
+ import { sendContentScriptTelemetry } from '../../utils/telemetry';
+ import type { FrameMessageHandler } from '../client/client.channel';
+ import type { FieldHandle } from '../form/field';
++import { validateAction } from '../form/field.utils';
+ import type { FormHandle } from '../form/form';
+ import { autofillCCFields } from './autofill.cc';
+ import { autofillIdentityFields } from './autofill.identity';
++import { getLoginEmailField } from './autofill.login-email';
+ 
+ type AutofillCounters = {
+     /** Number of autofillable login credentials for the current
+@@ -160,6 +164,49 @@ export const createAutofillService = ({ controller }: ContentScriptContextFactor
+         );
+     });
+ 
++    const pendingEmailMatches = new WeakSet<FieldHandle>();
++    const autofillLoginByEmail = withContext<(field: FieldHandle) => Promise<void>>(async (ctx, field) => {
++        if (!ctx?.mainFrame || pendingEmailMatches.has(field) || !isInputElement(field.element)) return;
++
++        const target = field.element;
++        const identifier = getLoginEmailField(field);
++        if (!identifier || !isInputElement(identifier.element)) return;
++
++        const email = identifier.element.value.trim();
++        if (!/^[^@\s]+@[^@\s]+$/.test(email)) return;
++
++        const ready = () => {
++            if (!ctx.getState().authorized || !validateAction(field, DropdownAction.AUTOFILL_LOGIN)) return false;
++            if (!field.tracked || field.actionPrevented || !isActiveElement(target) || !target.isConnected)
++                return false;
++            if (target.type !== 'password' || target.value || target.matches(':disabled') || target.readOnly)
++                return false;
++            if (getLoginEmailField(field) !== identifier || !identifier.element.isConnected) return false;
++            if (identifier.element.value.trim() !== email || target.form !== identifier.element.form) return false;
++
++            const origin = window.location.origin;
++            const action = target.form?.action;
++            const actionUrl = action ? new URL(action, document.baseURI) : window.location;
++            return window.location.protocol === 'https:' && actionUrl.origin === origin;
++        };
++
++        if (!ready()) return;
++        pendingEmailMatches.add(field);
++        try {
++            if (!(await identifier.getVisibility()) || !(await field.getVisibility()) || !ready()) return;
++
++            const response = await sendMessage(
++                contentScriptMessage({ type: WorkerMessageType.AUTOFILL_LOGIN_BY_EMAIL, payload: { email } })
++            );
++            if (response.type !== 'success' || !response.password || !ready()) return;
++
++            await field.autofill(response.password, { noFocus: true });
++            if (target.value === response.password) ctx.service.inline.dropdown.close({ type: 'field', field });
++        } finally {
++            pendingEmailMatches.delete(field);
++        }
++    });
++
+     const autofillPassword = autofillSequence(
+         withContext<(form: FormHandle, password: string) => Promise<void>>(async (ctx, form, password) => {
+             const url = ctx?.getExtensionContext()?.frameUrl;
+@@ -390,6 +437,7 @@ export const createAutofillService = ({ controller }: ContentScriptContextFactor
+         autofillEmail,
+         autofillIdentity,
+         autofillLogin,
++        autofillLoginByEmail,
+         autofillOTP,
+         autofillPassword,
+         evaluateOTP,
+diff --git a/applications/pass-extension/src/app/content/services/form/field.tracker.ts b/applications/pass-extension/src/app/content/services/form/field.tracker.ts
+index 0c42b3058ee38e3374d77c07d2d9381841b71b87..d2f9a97524ef204ebf4836017aba21a5ec257071 100644
+--- a/applications/pass-extension/src/app/content/services/form/field.tracker.ts
++++ b/applications/pass-extension/src/app/content/services/form/field.tracker.ts
+@@ -8,6 +8,7 @@ import { pipe } from '@proton/pass/utils/fp/pipe';
+ import { createListenerStore } from '@proton/pass/utils/listener/factory';
+ import { logger } from '@proton/pass/utils/logger';
+ import { DOM_SETTLE_MS, onNextTick } from '@proton/pass/utils/time/next-tick';
++import noop from '@proton/utils/noop';
+ 
+ import { isCCField } from '../../../../lib/utils/field';
+ import { withContext } from '../../context/context';
+@@ -176,6 +177,29 @@ export const createFieldTracker = withContext<(field: FieldHandle, formTracker?:
+         listeners.addListener(field.element, 'focusout', onBlur);
+         listeners.addListener(field.element, 'input', onInput);
+         listeners.addListener(field.element, 'mousedown', onFocus);
++
++        // A focus event alone is insufficient: a page can focus a field from script.
++        if (field.fieldType === FieldType.PASSWORD_CURRENT) {
++            listeners.addListener(field.element, 'click', (event: MouseEvent) => {
++                if (event.isTrusted && event.detail > 0 && !event.defaultPrevented) {
++                    void ctx?.service.autofill.autofillLoginByEmail(field).catch(noop);
++                }
++            });
++        } else if (field.fieldType === FieldType.EMAIL || field.fieldType === FieldType.USERNAME) {
++            listeners.addListener(field.element, 'keydown', (event: KeyboardEvent) => {
++                if (!event.isTrusted || event.key !== 'Tab' || event.shiftKey || event.defaultPrevented) return;
++
++                const [password] = field.getFormHandle().getFieldsFor(FieldType.PASSWORD_CURRENT);
++                if (password) {
++                    // Run after the browser completes sequential navigation; autofill rechecks focus.
++                    setTimeout(() => {
++                        if (!event.defaultPrevented && isActiveElement(password.element)) {
++                            void ctx?.service.autofill.autofillLoginByEmail(password).catch(noop);
++                        }
++                    }, 0);
++                }
++            });
++        }
+         listeners.addObserver(field.element, onAttributeChange, { attributeFilter: ['type'], attributeOldValue: true });
+ 
+         if (ctx) listeners.addSubscriber(ctx.observer.subscribe(onClientEvent));
+diff --git a/applications/pass-extension/src/app/content/services/inline/dropdown/app/Dropdown.tsx b/applications/pass-extension/src/app/content/services/inline/dropdown/app/Dropdown.tsx
+index 92e56bfaaeaa816dd29b5b3e3e0c26840a64f716..bddc82aaa2916b114523ed33b35962a8b828a055 100644
+--- a/applications/pass-extension/src/app/content/services/inline/dropdown/app/Dropdown.tsx
++++ b/applications/pass-extension/src/app/content/services/inline/dropdown/app/Dropdown.tsx
+@@ -156,7 +156,12 @@ export const Dropdown: FC<Props> = ({ initial = null }) => {
+                             case DropdownAction.AUTOFILL_IDENTITY:
+                                 return <AutofillIdentity {...state} />;
+                             case DropdownAction.AUTOFILL_LOGIN:
+-                                return <AutofillLogin {...state} />;
++                                return (
++                                    <AutofillLogin
++                                        key={`${state.frameId}:${state.formId}:${state.fieldId}`}
++                                        {...state}
++                                    />
++                                );
+                             case DropdownAction.AUTOSUGGEST_PASSWORD:
+                                 return <AutosuggestPassword {...state} />;
+                             case DropdownAction.AUTOSUGGEST_ALIAS:
+diff --git a/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.spec.tsx b/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.spec.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..836f3195ddd944b15515fc3635c4b940535104cc
+--- /dev/null
++++ b/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.spec.tsx
+@@ -0,0 +1,79 @@
++import type { PropsWithChildren } from 'react';
++
++import { fireEvent, render, screen } from '@testing-library/react';
++
++import { WorkerMessageType } from '../../../../../../../types/messages';
++import { DropdownAction } from '../../../../../constants.runtime';
++import { InlinePortMessageType } from '../../../inline.messages';
++import { AutofillLogin } from './AutofillLogin';
++
++const mockForwardMessage = jest.fn();
++const mockClose = jest.fn();
++const mockItems = [
++    {
++        name: 'First account',
++        userIdentifier: 'customer-1',
++        email: 'first@example.test',
++        shareId: 'vault',
++        itemId: 'one',
++    },
++    { name: 'Second account', userIdentifier: 'second@example.test', shareId: 'vault', itemId: 'two' },
++];
++
++jest.mock('@proton/atoms/Scroll/Scroll', () => ({ Scroll: ({ children }: PropsWithChildren) => children }));
++jest.mock('@proton/pass/components/Core/PassCoreProvider', () => ({ usePassCore: () => ({}) }));
++jest.mock('@proton/pass/hooks/useNavigateToUpgrade', () => ({ useNavigateToUpgrade: () => jest.fn() }));
++jest.mock('@proton/pass/hooks/useTelemetryEvent', () => ({ useTelemetryEvent: () => jest.fn() }));
++jest.mock('../../../../../../../lib/components/Inline/PauseListDropdown', () => ({ PauseListDropdown: () => null }));
++jest.mock('../../../../../../../lib/components/Inline/IFrameApp', () => ({
++    useIFrameAppState: () => ({ settings: {}, visible: true }),
++    useIFrameAppController: () => ({ close: mockClose, forwardMessage: mockForwardMessage }),
++    useRegisterMessageHandler: jest.fn(),
++}));
++jest.mock('../components/DropdownFocusController', () => ({ useFocusController: () => ({ focusRef: null }) }));
++jest.mock('../../../../../../../lib/message/send-message', () => ({
++    contentScriptMessage: (message: unknown) => message,
++    sendMessage: {
++        on: async (message: { type: WorkerMessageType }, resolve: (response: unknown) => void) => {
++            if (message.type === WorkerMessageType.AUTOFILL_LOGIN_QUERY) {
++                resolve({ type: 'success', items: mockItems, needsUpgrade: false });
++            }
++        },
++    },
++}));
++
++test('Shows the current email as a starting filter and lets the user find and select another login', async () => {
++    render(
++        <AutofillLogin
++            action={DropdownAction.AUTOFILL_LOGIN}
++            startsWith="second@example.test"
++            frameId={0}
++            formId="form"
++            fieldId="field"
++            frameOrigin="example.test"
++            origin="example.test"
++            telemetry={{ modelVersion: '', pageLanguage: '' }}
++        />
++    );
++
++    const search = await screen.findByRole('searchbox', { name: 'Search logins' });
++    expect(search).toHaveValue('second@example.test');
++    expect(screen.getByText('Second account')).toBeVisible();
++    expect(screen.queryByText('First account')).not.toBeInTheDocument();
++
++    fireEvent.change(search, { target: { value: 'beyond-the-vault@example.test' } });
++    expect(screen.getByText('No login found')).toBeVisible();
++
++    fireEvent.change(search, { target: { value: '' } });
++    expect(screen.getByText('First account')).toBeVisible();
++    expect(screen.getByText('Second account')).toBeVisible();
++
++    fireEvent.change(search, { target: { value: 'FIRST@EXAMPLE.TEST' } });
++    expect(screen.queryByText('Second account')).not.toBeInTheDocument();
++    fireEvent.click(screen.getByText('First account'));
++    expect(mockForwardMessage).toHaveBeenCalledWith({
++        type: InlinePortMessageType.AUTOFILL_ACTION,
++        payload: expect.objectContaining({ type: 'login', shareId: 'vault', itemId: 'one', fieldId: 'field' }),
++    });
++    expect(mockClose).toHaveBeenCalledWith({ userAction: true });
++});
+diff --git a/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.tsx b/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.tsx
+index fc141b16f4bf1979f0b50135b6d6820d2a0282c3..599804745173cede0b6c19c1db030cc19574b5c0 100644
+--- a/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.tsx
++++ b/applications/pass-extension/src/app/content/services/inline/dropdown/app/views/AutofillLogin.tsx
+@@ -1,8 +1,9 @@
+-import { type FC, useCallback, useEffect, useMemo } from 'react';
++import { type FC, useCallback, useEffect, useMemo, useState } from 'react';
+ 
+ import { c } from 'ttag';
+ 
+ import { CircleLoader } from '@proton/atoms/CircleLoader/CircleLoader';
++import { Input } from '@proton/atoms/Input/Input';
+ import Marks from '@proton/components/components/text/Marks';
+ import { IcArrowWithinSquare } from '@proton/icons/icons/IcArrowWithinSquare';
+ import { IcUser } from '@proton/icons/icons/IcUser';
+@@ -35,6 +36,7 @@ import type { DropdownAction } from '../../../../../constants.runtime';
+ import type { InlineMessageWithSender } from '../../../inline.messages';
+ import { InlinePortMessageType } from '../../../inline.messages';
+ import type { DropdownActions } from '../../dropdown.app';
++import { useFocusController } from '../components/DropdownFocusController';
+ import { DropdownHeader } from '../components/DropdownHeader';
+ 
+ type Props = Extract<DropdownActions, { action: DropdownAction.AUTOFILL_LOGIN }>;
+@@ -47,7 +49,10 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+     const navigateToUpgrade = useNavigateToUpgrade({ upsellRef: UpsellRef.LIMIT_AUTOFILL });
+ 
+     const [state, setState] = useMountedState<MaybeNull<AutofillLoginResult>>(null);
+-    const [filter, setFilterState] = useMountedState<string>(startsWith);
++    const [formFilter, setFormFilter] = useMountedState(startsWith);
++    const [search, setSearch] = useState<string | null>(null);
++    const { focusRef } = useFocusController();
++    const filter = (search ?? formFilter).trim();
+     const loading = useMemo(() => state === null, [state]);
+ 
+     const resolveCandidates = useCallback(
+@@ -60,7 +65,7 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+                          * pass the target `frameId`: the worker resolves its origin to scope
+                          * candidates to that frame (avoids offering top-level credentials in
+                          * an unrelated cross-origin sub-frame). */
+-                        payload: { frameId: payload.frameId },
++                        payload: { frameId: payload.frameId, includeEmail: true },
+                     }),
+                     (res) => {
+                         if (res.type === 'success') setState(res);
+@@ -73,7 +78,7 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+ 
+     const setFilter = useCallback(
+         ({ payload }: InlineMessageWithSender<InlinePortMessageType.AUTOFILL_FILTER>) =>
+-            setFilterState(payload.startsWith),
++            setFormFilter(payload.startsWith),
+         []
+     );
+ 
+@@ -85,7 +90,8 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+         if (visible) void resolveCandidates();
+         else {
+             setState(null);
+-            setFilterState('');
++            setFormFilter(startsWith);
++            setSearch(null);
+         }
+     }, [visible]);
+ 
+@@ -130,17 +136,18 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+                           />
+                       ),
+                       ...(filter
+-                          ? state.items.filter((item) => partOf(item.name, item.userIdentifier)(filter))
++                          ? state.items.filter((item) => partOf(item.name, item.userIdentifier, item.email)(filter))
+                           : state.items
+-                      ).map(({ shareId, itemId, userIdentifier, name, url }) => {
++                      ).map(({ shareId, itemId, userIdentifier, name, url, email }) => {
++                          const identifier = email && filter && partOf(email)(filter) ? email : userIdentifier;
+                           const nameChunks = matchChunks(name, filter);
+-                          const userChunks = matchChunks(userIdentifier, filter);
++                          const userChunks = matchChunks(identifier, filter);
+ 
+                           return (
+                               <ListItem
+                                   key={itemId}
+                                   title={<Marks chunks={nameChunks}>{name}</Marks>}
+-                                  subTitle={<Marks chunks={userChunks}>{userIdentifier}</Marks>}
++                                  subTitle={<Marks chunks={userChunks}>{identifier}</Marks>}
+                                   icon={{
+                                       type: 'icon',
+                                       icon: IcUser,
+@@ -170,6 +177,17 @@ export const AutofillLogin: FC<Props> = ({ startsWith, action, ...payload }) =>
+                     />
+                 }
+             />
++            <div className="px-3 pt-2 pb-1 shrink-0">
++                <Input
++                    ref={focusRef}
++                    type="search"
++                    value={search ?? formFilter}
++                    onValue={setSearch}
++                    aria-label={c('Label').t`Search logins`}
++                    placeholder={c('Placeholder').t`Search by email or name`}
++                    inputClassName="text-sm py-1"
++                />
++            </div>
+             {dropdownItems.length > 0 ? (
+                 <ScrollableItemsList>{dropdownItems}</ScrollableItemsList>
+             ) : (
+diff --git a/applications/pass-extension/src/app/content/services/inline/dropdown/dropdown.utils.ts b/applications/pass-extension/src/app/content/services/inline/dropdown/dropdown.utils.ts
+index 5234ba5f74948f925698df2151f17055c9c013d4..03cd4c325d54ee66f6f964097357bad07ff7cbff 100644
+--- a/applications/pass-extension/src/app/content/services/inline/dropdown/dropdown.utils.ts
++++ b/applications/pass-extension/src/app/content/services/inline/dropdown/dropdown.utils.ts
+@@ -20,6 +20,7 @@ import { DropdownAction } from '../../../constants.runtime';
+ import { DROPDOWN_WIDTH } from '../../../constants.static';
+ import { withContext } from '../../../context/context';
+ import { getAutofillPageTelemetryDimensions } from '../../../utils/autofill-telemetry';
++import { getLoginEmailField } from '../../autofill/autofill.login-email';
+ import type { FieldHandle } from '../../form/field';
+ import type { InlineCloseOptions } from '../inline.messages';
+ import type { DropdownHandler } from './dropdown.abstract';
+@@ -141,8 +142,10 @@ export const intoDropdownAction = withContext<(request: DropdownRequest) => Prom
+                 return { action, ...base };
+             case DropdownAction.AUTOFILL_IDENTITY:
+                 return { action, ...base };
+-            case DropdownAction.AUTOFILL_LOGIN:
+-                return { action, ...base, startsWith: '' };
++            case DropdownAction.AUTOFILL_LOGIN: {
++                const email = request.type === 'field' ? getLoginEmailField(request.field)?.element.value : undefined;
++                return { action, ...base, startsWith: email?.trim() ?? '' };
++            }
+             case DropdownAction.AUTOSUGGEST_ALIAS: {
+                 if (!tabUrl.displayName) return;
+                 return sendMessage.on(contentScriptMessage({ type: WorkerMessageType.AUTOSUGGEST_ALIAS }), (res) => {
+diff --git a/applications/pass-extension/src/app/worker/services/autofill.login-email.ts b/applications/pass-extension/src/app/worker/services/autofill.login-email.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d0e1ab0f69d5f518c1099ae959bd4deb3316f91
+--- /dev/null
++++ b/applications/pass-extension/src/app/worker/services/autofill.login-email.ts
+@@ -0,0 +1,20 @@
++export const getHttpsOrigin = (url?: string): string | undefined => {
++    try {
++        const parsed = new URL(url ?? '');
++        if (parsed.protocol === 'https:') return parsed.origin;
++    } catch {
++        // Invalid or incomplete URLs are not eligible for automatic password fill.
++    }
++};
++
++export const selectUniqueEmailLogin = <T>(
++    candidates: T[],
++    email: string,
++    identifiers: (candidate: T) => string[]
++): T | undefined => {
++    const normalized = email.trim().toLowerCase();
++    const matches = candidates.filter((candidate) =>
++        identifiers(candidate).some((value) => value.trim().toLowerCase() === normalized)
++    );
++    if (matches.length === 1) return matches[0];
++};
+diff --git a/applications/pass-extension/src/app/worker/services/autofill.spec.ts b/applications/pass-extension/src/app/worker/services/autofill.spec.ts
+index 7582a7aa1edb5e0db09d5f11cbc52c594f698387..ff7c12280205cc253e0b0d6eeabd16465b3c667a 100644
+--- a/applications/pass-extension/src/app/worker/services/autofill.spec.ts
++++ b/applications/pass-extension/src/app/worker/services/autofill.spec.ts
+@@ -192,6 +192,65 @@ describe('AutofillService', () => {
+         });
+     });
+ 
++    describe('`AUTOFILL_LOGIN_BY_EMAIL`', () => {
++        const matchLogin = (email: string) =>
++            sendMessage(contentScriptMessage({ type: WorkerMessageType.AUTOFILL_LOGIN_BY_EMAIL, payload: { email } }));
++
++        test('Resolves a unique exact match for the saved HTTPS origin', async () => {
++            expect(await matchLogin(username.toUpperCase())).toEqual({ type: 'success', password });
++        });
++
++        test('Rejects partial matches', async () => {
++            expect(await matchLogin(username.replace('victim', 'vic'))).toEqual({ type: 'success' });
++        });
++
++        test('Checks the separately saved email even when a different username is set', async () => {
++            const item = state.items.byShareId[mockShareId][mockItemId];
++            state.items.byShareId[mockShareId][mockItemId] = {
++                ...item,
++                data: itemBuilder('login').set('content', (content) =>
++                    content.merge({
++                        autofillUrls: [{ url: topLevelURL, mode: AutofillMode.Default }],
++                        itemUsername: 'bank-customer-number',
++                        itemEmail: username,
++                        password,
++                    })
++                ).data,
++            };
++            expect(await matchLogin(username)).toEqual({ type: 'success', password });
++            const search = await queryLogins({ includeEmail: true });
++            expectMessageSuccess(search);
++            expect(search.items[0]).toEqual(expect.objectContaining({ email: username }));
++        });
++
++        test('Rejects duplicate login records for the same address', async () => {
++            const duplicateId = uniqueId();
++            state.items.byShareId[mockShareId][duplicateId] = {
++                ...state.items.byShareId[mockShareId][mockItemId],
++                itemId: duplicateId,
++            };
++
++            expect(await matchLogin(username)).toEqual({ type: 'success' });
++        });
++
++        test.each([
++            ['same-origin iframe', topLevelURL, topLevelURL, subFrameId],
++            ['other frame origin', topLevelURL, attackerFrameURL, subFrameId],
++            ['unrelated top origin', attackerFrameURL, attackerFrameURL, 0],
++            ['sibling port', 'https://bank.example:444/login', 'https://bank.example:444/login', 0],
++            ['subdomain', 'https://login.bank.example', 'https://login.bank.example', 0],
++            ['non-HTTPS', 'http://bank.example', 'http://bank.example', 0],
++        ])('Does not return a password for %s', async (_, top, frame, frameId) => {
++            setMockMessageSender(top, 1, frame, frameId);
++            expect(await matchLogin(username)).toEqual({ type: 'success' });
++        });
++
++        test('Does not return a password while the vault is locked', async () => {
++            authorized = false;
++            expect(await matchLogin(username)).toEqual({ type: 'success' });
++        });
++    });
++
+     describe('`AUTOFILL_ACTION`', () => {
+         test('Delivers the selected login credentials to the target frame', async () => {
+             const result = await sendMessage(
+diff --git a/applications/pass-extension/src/app/worker/services/autofill.ts b/applications/pass-extension/src/app/worker/services/autofill.ts
+index d62415031a8c85e64034ad3c160f18a5f003694c..3e7e957c5daf8e84741fdbfd7f799ad5fc0f262c 100644
+--- a/applications/pass-extension/src/app/worker/services/autofill.ts
++++ b/applications/pass-extension/src/app/worker/services/autofill.ts
+@@ -22,7 +22,10 @@ import {
+ } from '@proton/pass/lib/items/item.utils';
+ import { DEFAULT_RANDOM_PW_OPTIONS } from '@proton/pass/lib/password/constants';
+ import type { PrivateDomains } from '@proton/pass/lib/search/types';
++import { enableLoginAutofill } from '@proton/pass/lib/settings/utils';
+ import type { SearchItemsByDomainOptions } from '@proton/pass/lib/urls/types';
++import { isAutofillTargetMode } from '@proton/pass/lib/urls/utils/autofill';
++import { parseUrl } from '@proton/pass/lib/urls/utils/parser';
+ import { isPaidPlan } from '@proton/pass/lib/user/user.predicates';
+ import { assignedModelIdUpdated } from '@proton/pass/store/actions/creators/assigned-model-id';
+ import { itemAutofilled } from '@proton/pass/store/actions/creators/item';
+@@ -42,6 +45,7 @@ import {
+     selectAutosuggestCopyToClipboard,
+     selectClipboardTTL,
+     selectPasswordOptions,
++    selectProxiedSettings,
+ } from '@proton/pass/store/selectors/settings';
+ import { selectAutofillModelExperimentGroup, selectPassPlan } from '@proton/pass/store/selectors/user';
+ import type { ItemContent, ItemRevision, SelectedItem } from '@proton/pass/types/data/items';
+@@ -55,6 +59,7 @@ import { deobfuscate } from '@proton/pass/utils/obfuscate/xor';
+ import noop from '@proton/utils/noop';
+ 
+ import { backgroundMessage, sendTabMessage } from '../../../lib/message/send-message';
++import { computeFeatures } from '../../../lib/utils/features';
+ import type { AutofillableFrame } from '../../../lib/utils/frames';
+ import { getAutofillableFrames } from '../../../lib/utils/frames';
+ import { setPopupIconBadge } from '../../../lib/utils/popup';
+@@ -67,6 +72,7 @@ import WorkerMessageBroker from '../channel';
+ import { onContextReady, withContext } from '../context/inject';
+ import { createBasicAuthController } from '../listeners/auth-required';
+ import { resolveCCFormFields } from './autofill.cc';
++import { getHttpsOrigin, selectUniqueEmailLogin } from './autofill.login-email';
+ 
+ type AutofillServiceState = {
+     modelArtifacts: ModelArtifactCache;
+@@ -425,7 +431,10 @@ export const createAutoFillService = () => {
+ 
+             const { shareIds, needsUpgrade } = getAutofillOptions(payload.writable);
+ 
+-            const items = getLoginCandidates(host, { shareIds }).map(intoLoginItemPreview);
++            const items = getLoginCandidates(host, { shareIds }).map((item) => ({
++                ...intoLoginItemPreview(item),
++                ...(payload.includeEmail && { email: deobfuscate(item.data.content.itemEmail) }),
++            }));
+ 
+             /** Only top-frame queries reflect the tab-level badge count */
+             const shouldUpdateBadge = !payload.domain && frameId === 0;
+@@ -435,6 +444,39 @@ export const createAutoFillService = () => {
+         })
+     );
+ 
++    WorkerMessageBroker.registerMessage(
++        WorkerMessageType.AUTOFILL_LOGIN_BY_EMAIL,
++        onContextReady(({ getState, service }, { payload }, sender) => {
++            const url = sender.url;
++            const origin = getHttpsOrigin(url);
++            if (!getState().authorized || sender.tab?.id === undefined || sender.frameId !== 0 || !origin || !url) {
++                return {};
++            }
++            if (getHttpsOrigin(sender.tab.url) !== origin) return {};
++
++            const email = payload.email;
++            if (typeof email !== 'string' || !/^[^@\s]+@[^@\s]+$/.test(email)) return {};
++
++            const settings = selectProxiedSettings(service.store.getState());
++            const parsed = parseUrl(url);
++            if (!computeFeatures(settings, parsed, parsed).Autofill) return {};
++            if (!(settings.autofill.login ?? enableLoginAutofill(settings.autofill))) return {};
++
++            const { shareIds } = getAutofillOptions();
++            const item = selectUniqueEmailLogin(getLoginCandidates(url, { shareIds }), email, (candidate) => {
++                const { itemEmail, itemUsername } = candidate.data.content;
++                return [deobfuscate(itemEmail), deobfuscate(itemUsername)];
++            });
++            if (!item) return {};
++
++            const { autofillUrls, password } = item.data.content;
++            const exactOrigin = autofillUrls.some(
++                ({ url, mode }) => isAutofillTargetMode(mode) && getHttpsOrigin(url) === origin
++            );
++            return exactOrigin ? { password: deobfuscate(password) } : {};
++        })
++    );
++
+     WorkerMessageBroker.registerMessage(
+         WorkerMessageType.AUTOFILL_IDENTITY_QUERY,
+         onContextReady(async (ctx, _, sender) => {
+diff --git a/applications/pass-extension/src/types/messages.ts b/applications/pass-extension/src/types/messages.ts
+index 6a91bb0d944114a631503f991335a350e5ee0a5f..bbf894ca87b61f7e9cef0b21f261f09500d05106 100644
+--- a/applications/pass-extension/src/types/messages.ts
++++ b/applications/pass-extension/src/types/messages.ts
+@@ -105,6 +105,7 @@ export enum WorkerMessageType {
+     AUTOFILL_CC_QUERY = 'AUTOFILL_CC_QUERY',
+     AUTOFILL_IDENTITY_QUERY = 'AUTOFILL_IDENTITY_QUERY',
+     AUTOFILL_LOGIN_QUERY = 'AUTOFILL_LOGIN_QUERY',
++    AUTOFILL_LOGIN_BY_EMAIL = 'AUTOFILL_LOGIN_BY_EMAIL',
+     AUTOFILL_OTP_CHECK = 'AUTOFILL_OTP_CHECK',
+     AUTOFILL_SEQUENCE = 'AUTOFILL_SEQUENCE',
+     AUTOFILL_SYNC = 'AUTOFILL_SYNC',
+@@ -211,6 +212,7 @@ type AuthOfflineSwitchMessage = { type: WorkerMessageType.AUTH_OFFLINE_SWITCH };
+ export type AuthPullForkMessage = WithPayload<WorkerMessageType.AUTH_PULL_FORK, { selector: string }>;
+ type AuthUnlockMessage = WithPayload<WorkerMessageType.AUTH_UNLOCK, UnlockDTO>;
+ 
++type AutofillLoginByEmailMessage = WithPayload<WorkerMessageType.AUTOFILL_LOGIN_BY_EMAIL, { email: string }>;
+ type AutofillActionMessage = WithPayload<WorkerMessageType.AUTOFILL_ACTION, AutofillActionDTO>;
+ type AutofillCCQueryMessage = { type: WorkerMessageType.AUTOFILL_CC_QUERY };
+ type AutofillIdentityQueryMessage = { type: WorkerMessageType.AUTOFILL_IDENTITY_QUERY };
+@@ -321,6 +323,7 @@ export type WorkerMessage =
+     | AutofillActionMessage
+     | AutofillCCQueryMessage
+     | AutofillIdentityQueryMessage
++    | AutofillLoginByEmailMessage
+     | AutofillLoginQueryMessage
+     | AutofillOTPCheckMessage
+     | AutofillPasswordOptionsMessage
+@@ -422,6 +425,7 @@ type WorkerMessageResponseMap = {
+     [WorkerMessageType.AUTH_UNLOCK]: Result<{}, { errorType?: NativeMessageErrorType }>;
+     [WorkerMessageType.AUTOFILL_CC_QUERY]: AutofillCCResult;
+     [WorkerMessageType.AUTOFILL_IDENTITY_QUERY]: AutofillIdentityResult;
++    [WorkerMessageType.AUTOFILL_LOGIN_BY_EMAIL]: { password?: string };
+     [WorkerMessageType.AUTOFILL_LOGIN_QUERY]: AutofillLoginResult;
+     [WorkerMessageType.AUTOFILL_OTP_CHECK]: { shouldPrompt: false } | ({ shouldPrompt: true } & LoginItemPreview);
+     [WorkerMessageType.AUTOFILL_SEQUENCE]: AutofillResult;
+diff --git a/packages/pass/package.json b/packages/pass/package.json
+index 49e808b5d3a788d02b9e93558ff1b9ddaaa232d7..b482f509d940394307d42209fb79c3d9db954974 100644
+--- a/packages/pass/package.json
++++ b/packages/pass/package.json
+@@ -273,6 +273,7 @@
+         "./lib/telemetry/utils": "./lib/telemetry/utils.ts",
+         "./lib/urls/search/match-url": "./lib/urls/search/match-url.ts",
+         "./lib/urls/types": "./lib/urls/types.ts",
++        "./lib/urls/utils/autofill": "./lib/urls/utils/autofill.tsx",
+         "./lib/urls/utils/parser": "./lib/urls/utils/parser.ts",
+         "./lib/urls/utils/utils": "./lib/urls/utils/utils.ts",
+         "./lib/user/user.predicates": "./lib/user/user.predicates.ts",
+diff --git a/packages/pass/types/worker/autofill.ts b/packages/pass/types/worker/autofill.ts
+index ec3dfca24f2c791351ce4c5ffc0c0c40580e58b8..81d9e1f07844734347c327711d6f0ab2d0d23dbc 100644
+--- a/packages/pass/types/worker/autofill.ts
++++ b/packages/pass/types/worker/autofill.ts
+@@ -1,7 +1,7 @@
+ import type { CCItemPreview, IdentityItemPreview, LoginItemPreview } from './data';
+ import type { FrameId } from './runtime';
+ 
+-export type AutofillLoginResult = { items: LoginItemPreview[]; needsUpgrade: boolean };
++export type AutofillLoginResult = { items: (LoginItemPreview & { email?: string })[]; needsUpgrade: boolean };
+ export type AutofillIdentityResult = { items: IdentityItemPreview[]; needsUpgrade: boolean };
+ export type AutofillCCResult = { items: CCItemPreview[]; needsUpgrade: boolean };
+ 
+@@ -17,4 +17,6 @@ export type AutofillQueryFilter = {
+      * worker-side to its origin. When omitted, the sender's own
+      * frame URL is trusted (in-frame content-script query). */
+     frameId?: FrameId;
++    /** Include the separately saved email for the inline login search. */
++    includeEmail?: boolean;
+ };
